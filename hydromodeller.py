@@ -1,6 +1,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 import arcpy
 import numpy as np
+import pandas as pd
 from datetime import datetime
 
 
@@ -136,83 +137,66 @@ def get_discharge(rivers, network, nodes, length, flowacc_fc, gscd_fc):
     # Create a points feature class, and add points using the coordinates of every node
     desc = arcpy.Describe(rivers)
     nodes_fc = rivers + '_temp_nodes'
-    arcpy.CreateFeatureclass_management(arcpy.env.workspace, nodes_fc, geometry_type='POINT',
-                                        spatial_reference=desc.spatialReference)
-    with arcpy.da.InsertCursor(nodes_fc, ['SHAPE@XY']) as cursor:
-        for node in nodes:
-            xy = (node[1], node[2])
-            cursor.insertRow([xy])
 
-    # Extract the Flow accumulation and gscd values into these points, from the rasters
-    flowacc_field = 'FlowAccummulation'
-    gscd_field = 'RunOff'
-
-    arcpy.CheckOutExtension("Spatial")
-
-    # Created an upsampled version of the flowacc feature class, to make sure nodes hit the value
-    flowacc_agg = arcpy.sa.Aggregate(flowacc_fc, 10, "MAXIMUM", "EXPAND", "DATA")
-    flowacc_agg_fc = 'flowacc_agg_temp'
-    flowacc_agg.save(flowacc_agg_fc)
-
-    # might have to run these directly in ArcMap (license issue)
-    # sa.ExtractMultiValuesToPoints(nodes_fc, [[flowacc_fc, flowacc_field]])
-    arcpy.sa.ExtractMultiValuesToPoints(nodes_fc, [[flowacc_agg_fc, flowacc_field]])
-    arcpy.sa.ExtractMultiValuesToPoints(nodes_fc, [[gscd_fc, gscd_field]])
-
-    # Create an array called node_dis
-    # It has the following structure:
-    # - 0       - 1         - 2         - 3                 - 4         -
-    # - index   - flowacc   - runoff    - actual_flowacc    - discharge -
-    # load flowacc and runoff from the shapefile we just created
-    node_dis = np.zeros([len(nodes), 5], dtype=float)
-    counter = 0
-    with arcpy.da.SearchCursor(nodes_fc, [flowacc_field, gscd_field]) as cursor:
-        for row in cursor:
-            node_dis[counter] = [counter, row[0], row[1], 0, 0]
-            print('added nodedis ' + str(counter))
-            counter += 1
+    dt = {'names': ['x', 'y']}
+    nodes_arr = np.zeros(len(nodes), dtype=dt)
+    nodes_arr['x'] = [n[1] for n in nodes]
+    nodes_arr['x'] = [n[2] for n in nodes]
+    arcpy.da.NumPyArrayToFeatureClass(nodes_arr, nodes_fc, ('x', 'y'),
+                                      spatial_reference=desc.spatialReference)
 
     # Clean up the coordinates from nodes now that we're done with that
     nodes = [row[3:] for row in nodes]
 
+    # Extract the Flow accumulation and gscd values into these points, from the rasters
+    flowacc = 'FlowAccummulation'
+    gscd = 'RunOff'
+    flowacc_local = 'actual_flowacc'
+    discharge = 'discharge'
+    arcpy.sa.ExtractMultiValuesToPoints(nodes_fc, [[flowacc_fc, flowacc]])
+    arcpy.sa.ExtractMultiValuesToPoints(nodes_fc, [[gscd_fc, gscd]])
+
+    # load flowacc and runoff from the shapefile we just created
+    nodes_discharge_df = pd.DataFrame(arcpy.da.TableToNumPyArray(nodes_fc, (flowacc, gscd),
+                                                                 skip_nulls=False, null_value=0))
+    nodes_discharge_df[flowacc_local] = 0
+
     # For each node, subtract the flow accumulation for all upstream nodes,
     # so that we calculate it's 'self discharge' only for it's directly contributing area
     for index, node in enumerate(nodes):
-        actual_flowacc = node_dis[index][1]  # flowAcc
+        actual_flowacc = nodes_discharge_df[flowacc][index]
         for arc in node:
             if network[arc][2] == index:  # up the arc flows *into* the node
-                subtract = node_dis[network[arc][1]][1]
+                subtract = nodes_discharge_df[flowacc][network[arc][1]]
                 actual_flowacc -= subtract  # subtract upstream flowAcc
-        node_dis[index][3] = actual_flowacc
+        nodes_discharge_df[flowacc_local][index] = actual_flowacc
 
-    cell = arcpy.GetRasterProperties_management(flowacc_fc, 'CELLSIZEX').getOutput(0)
-    area = float(cell) * float(cell)
-    # and calculate the proper value in m^3/s - 8760 (h/year) * 3600 (s/h) * 1000 (mm/m) = 3153600000
+    area = arcpy.GetRasterProperties_management(flowacc_fc, 'CELLSIZEX').getOutput(0) ** 2
 
     # calculate self discharge for each node
     # some flowacc values are negative, because hydrosheds doesn't line up properly
     # therefore, any points that are negative set to use their original flowaccu
-    for node in node_dis:
-        node[4] = node[2]*node[3]*area/3153600000
-        if node[4] < 0:
-            node[4] = 0
+    # Q [m3/s] = runoff [mm] * flowacc [number] * area [m2] / 8760 [h/year] * 3600 [s/h] * 1000 [mm/m]
+    nodes_discharge_df.loc[nodes_discharge_df[flowacc_local] < 0, flowacc_local] = nodes_discharge_df[flowacc]
+    nodes_discharge_df['discharge'] = nodes_discharge_df[gscd] * nodes_discharge_df[flowacc_local] * area / (
+        8760*3600*1000)
 
-    # start from Shreve order 1, and contribute all discharges from upstread nodes to downstream nodes
+    # start from Shreve order 1, and contribute all discharges from upstream nodes to downstream nodes
+    water_loss = 0.2
     for so in range(1, max(network.T[3])+1):
         for arc in network:
             if arc[3] == so:
-                node_dis[arc[2]][4] += node_dis[arc[1]][4]*0.8
+                nodes_discharge_df[discharge][arc[2]] += nodes_discharge_df[discharge][arc[1]]*(1-water_loss)
 
     # create a new array indexed to the network array
     # and add the discharge from the upstream node of each arc to that arc
     discharge = np.empty(length, dtype=float)
     for index, arc in enumerate(network):
-        discharge[index] = node_dis[arc[1]][4]
+        discharge[index] = nodes_discharge_df[discharge][arc[1]]
 
     # add the results back into the ArcGIS feature
-    discharge_field = 'Discharge'
-    arcpy.AddField_management(rivers, discharge_field, 'FLOAT')
-    with arcpy.da.UpdateCursor(rivers, [discharge_field]) as cursor:
+    arcpy.AddField_management(rivers, discharge, 'FLOAT')
+    with arcpy.da.UpdateCursor(rivers, [discharge]) as cursor:
         for index, row in enumerate(cursor, start=0):
             row[0] = discharge[index]
             cursor.updateRow(row)
@@ -240,66 +224,46 @@ def calc_hydro_potential(rivers, elevation, discharge, interval, points):
                         cur_length += interval
 
     arcpy.sa.ExtractMultiValuesToPoints(points, [[elevation, 'elev']])
-
-    # calculate the elevation difference between successive points
-    arcpy.AddField_management(points, 'head', 'FLOAT')
-    with arcpy.da.UpdateCursor(points, [fid_name, 'elev', 'head']) as cursor:
-        prev_fid = 0
-        prev_elev = 0
-
-        for row in cursor:
-            if row[1]:  # check to make sure an elevation entry exists
-                current_fid = row[0]
-                current_elev = row[1]
-
-                if (current_fid == prev_fid) and ((prev_elev - current_elev) > 0):
-                    row[2] = prev_elev - current_elev
-                else:
-                    row[2] = 0
-
-                cursor.updateRow(row)
-                prev_fid = current_fid
-                prev_elev = current_elev
-            else:
-                row[2] = 0
-                prev_fid = row[0]
-                prev_elev = 0
-
-    # delete all points where head is 0 or negative
-    with arcpy.da.UpdateCursor(points, 'head') as cursor:
-        for row in cursor:
-            if row[0] <= 0:
-                cursor.deleteRow()
-
     arcpy.sa.ExtractMultiValuesToPoints(points, [[discharge, 'discharge_second']])
 
-    # before calculating the power, delete any points that will result in a value absurdly large or small
-    # (LONG only goes up to 2 billion)
-    # currently set at less than 10 litres/sec, or more than 2000 m^3/sec
-    discharge_lower_cutoff = 0.01
-    discharge_upper_cutoff = 2000
-    with arcpy.da.UpdateCursor(points, 'discharge_second') as cursor:
-        for row in cursor:
-            if row[0] < discharge_lower_cutoff or row[0] > discharge_upper_cutoff:
-                cursor.deleteRow()
+    points_df = pd.DataFrame(arcpy.da.TableToNumPyArray(points, (fid_name, 'elev', 'discharge_second'),
+                                                        skip_nulls=False, null_value=0))
+
+    # calculate the elevation difference (head) between successive points
+    points_df['head'] = 0
+    prev_fid = 0
+    prev_elev = 0
+    for index, point in points_df.iterrows():
+        if point['elev']:  # check to make sure an elevation entry exists
+            current_fid = point[fid_name]
+            current_elev = point['elev']
+
+            if (current_fid == prev_fid) and ((prev_elev - current_elev) > 0):
+                point['head'] = prev_elev - current_elev
+            else:
+                point['head'] = 0
+
+            prev_fid = current_fid
+            prev_elev = current_elev
+        else:
+            point['head'] = 0
+            prev_fid = point[fid_name]
+            prev_elev = 0
 
     # calculate the power in watts based on Alex's formula
     # P = rho * g * nt * ng * conv * Q * deltaH
-    rho = '1000'  # density
-    g = '9.81'  # gravity
-    nt = '0.88'  # turbine efficiency
-    ng = '0.96'  # generator efficiency
-    conv = '0.6'  # conversion factor for environmental flow deduction
-    arcpy.AddField_management(points, 'power', 'FLOAT')
-    arcpy.CalculateField_management(points, 'power',
-                                    rho + '*' + g + '*' + nt + '*' + ng + '*' + conv + '* !discharge_second! * !head!',
-                                    'PYTHON_9.3')
+    rho = 1000  # density
+    g = 9.81  # gravity
+    nt = 0.88  # turbine efficiency
+    ng = 0.96  # generator efficiency
+    conv = 0.6  # conversion factor for environmental flow deduction
+    points_df['power'] = rho*g*nt*ng*conv*points_df['discharge_second']*points_df['head']
 
 
 def runner():
     arcpy.env.workspace = r'C:/Users/Chris/Work/GIS/Data/Default.gdb'
     rivers = 'riv_beni'
-    flowacc_fc = r'C:/Users/Chris/Work/GIS/Data/Hydrology/elevation/flow_accu'
+    flowacc_fc = r'C:/Users/Chris/Work/GIS/Data/Hydrology/elevation/flow_accu'  # should already be up-aggregated
     gscd_fc = r'C:/Users/Chris/Work/GIS/Data/Hydrology/streamflow/gscd'
 
     arcpy.env.overwriteOutput = True
