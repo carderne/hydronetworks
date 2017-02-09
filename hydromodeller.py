@@ -48,7 +48,10 @@ def shreve(arc_index, direction_node_id, network, nodes):
                         up_stream_orders.append(shreve(arc, network[arc][6], network, nodes))
 
         max_orders = heapq.nlargest(2, up_stream_orders)
-        order = 0 + max_orders[0] + max_orders[1]
+        if len(max_orders) == 2:
+            order = 0 + max_orders[0] + max_orders[1]
+        else:
+            order = 0 + max(up_stream_orders)
 
         network[arc_index][7] = order
 
@@ -173,9 +176,22 @@ def create_network(fc_rivers):
     return network, nodes
 
 
+def calc_stream_order(network, nodes):
+    """
+    """
+
+    for node in nodes:
+        if len(node) == 4:  # only one arc connected
+            if node[1] == network[node[3]][3] and node[2] == network[node[3]][4]:
+                sink = network[node[3]][0]
+                network[sink][7] = shreve(sink, network[sink][5], network, nodes)
+
+    return network
+
+
 def prepare_nodes(fc_rivers, nodes, fc_flow_acc, fc_gscd, fc_land_type, fc_et_ref):
     """
-    Calculate the discharge at each point by accumulating runoffs and discharges downstream
+    Get the geospatial characteristics at each node
     """
 
     # Create a points feature class, and add points using the coordinates of every node
@@ -245,7 +261,8 @@ def rainfall_runoff(nodes_df):
     runoff_df = pd.DataFrame(columns=precipitation_df.columns, index=precipitation_df.index)
 
     # k_c should vary by month...
-    k_c = {1: 0.6,
+    k_c = {0: 0.6,  # there shouldn't be a zero, this is error handling
+           1: 0.6,
            2: 0.9,
            3: 0.6,
            4: 0.6,
@@ -263,6 +280,7 @@ def rainfall_runoff(nodes_df):
     nodes_df['runoff_to_gw_fraction'] = 0.5
     for index, row in runoff_df.iterrows():
         print('calibrate {}'.format(index))
+        counter = 0
         while True:
             for col in runoff_df:
                 et_ref = nodes_df.loc[index, field_et_ref]
@@ -277,9 +295,12 @@ def rainfall_runoff(nodes_df):
             ref_value = nodes_df.loc[index, field_gscd]
             calc_value = runoff_df.loc[index].mean() * 12  # to compare with annual gscd
 
-            if abs((calc_value - ref_value) / ref_value) < 0.1:
+            if counter > 10:
+                break
+            elif abs((calc_value - ref_value) / ref_value) < 0.5:
                 break
             else:
+                counter += 1
                 nodes_df.loc[index, 'precip_effective'] *= 1 + (calc_value - ref_value) / ref_value / 10
                 nodes_df.loc[index, 'runoff_to_gw_fraction'] *= 1 + (calc_value - ref_value) / ref_value / 10
 
@@ -296,6 +317,7 @@ def calc_discharge(nodes_df, runoff_df, network, fc_flow_acc, fc_rivers):
     # Q [m3/s] = runoff [mm] * flowacc [number] * area [m2] / 8760 [h/year] * 3600 [s/h] * 1000 [mm/m]
     discharge_df = pd.DataFrame(columns=runoff_df.columns, index=runoff_df.index)
     for index, row in discharge_df.iterrows():
+        print('discharge {}'.format(index))
         for col in discharge_df:
             # TODO need to take into account different month lengths
             discharge_df.loc[index, col] = runoff_df.loc[index, col]*nodes_df.loc[index, field_flow_acc_local]*area / (
@@ -310,6 +332,7 @@ def calc_discharge(nodes_df, runoff_df, network, fc_flow_acc, fc_rivers):
     for so in range(1, max(network.T[7])+1):
         for arc in network:
             if arc[7] == so:
+                print('contribute {}'.format(arc[0]))
                 nodes_df.loc[arc[6], field_discharge_accumulated] += nodes_df.loc[arc[5], field_discharge_accumulated]*(
                     1-water_loss)
                 for col in discharge_df:
@@ -386,6 +409,7 @@ def calc_hydro_potential(fc_rivers, fc_elevation, interval, fc_points, network_d
 
     points_df = pd.DataFrame(arcpy.da.TableToNumPyArray(fc_points, (field_arc_id, field_elevation),
                                                         skip_nulls=False, null_value=0))
+
     points_df[field_discharge_accumulated] = -99
     points_df[field_discharge_max] = -99
     points_df[field_discharge_mean] = -99
@@ -462,23 +486,21 @@ def calc_hydro_potential(fc_rivers, fc_elevation, interval, fc_points, network_d
 
 def runner():
     arcpy.env.workspace = r'C:/Users/Chris/Documents/GIS/HydroModeller.gdb'
-    fc_rivers = 'rivers_small_projected'
-    fc_flow_acc = 'flow_acc_projected'
+    fc_rivers = 'rivers_ug_small_projected'
+    fc_flow_acc = 'flow_acc_af_projected'
     fc_gscd = 'gscd_qmean_projected'
     fc_land_type = 'land_type_projected'
     # TODO maybe need to aggregate elevation, as doesn't capture always
-    fc_elevation = 'elevation'
-    fc_points = 'hydro_points'
+    fc_elevation = 'elevation_af_projected'
+    fc_points = 'hydro_points_ug'
     fc_et_ref = 'et_ref_projected'
 
     arcpy.env.overwriteOutput = True
     arcpy.env.addOutputsToMap = False
-    object_id = 2
-    sink = object_id - 1
-    interval = 500
+    interval = 1000
 
     network, nodes = create_network(fc_rivers)
-    network[sink][7] = shreve(sink, network[sink][5], network, nodes)
+    network = calc_stream_order(network, nodes)
     nodes_df = prepare_nodes(fc_rivers, nodes, fc_flow_acc, fc_gscd, fc_land_type, fc_et_ref)
     nodes_df = calc_flow_acc(nodes_df, network)
     nodes_df, runoff_df = rainfall_runoff(nodes_df)
