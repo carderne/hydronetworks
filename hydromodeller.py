@@ -1,12 +1,9 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
-from os import path
-# arcpy = path.join(r'C:\Program Files (x86)\ArcGIS\Desktop10.5\arcpy\arcpy', "arcpy")
 import arcpy
 import numpy as np
 import pandas as pd
 import heapq
 from os.path import join
-# from math import log
 from datetime import datetime
 
 
@@ -29,6 +26,8 @@ field_power_mean = 'power_mean'
 field_power_min = 'power_min'
 field_arc_id = 'arc_id'
 field_et_ref = 'et_ref'
+field_precip = 'precip_'
+days_per_month = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
 
 
 def shreve(arc_index, direction_node_id, network, nodes):
@@ -97,7 +96,8 @@ def strahler(arc_index, direction_node_id, network, nodes):
 
 
 class HydroModeller:
-    def __init__(self, fc_rivers, fc_flow_acc, fc_gscd, fc_land_type, fc_elevation, fc_points, fc_et_ref, fc_nodes):
+    def __init__(self, fc_rivers, fc_flow_acc, fc_gscd, fc_land_type, fc_elevation, fc_points, fc_et_ref, fc_nodes,
+                 fc_precip_prefix):
         self.fc_rivers = fc_rivers
         self.fc_flow_acc = fc_flow_acc
         self.fc_gscd = fc_gscd
@@ -106,12 +106,13 @@ class HydroModeller:
         self.fc_points = fc_points
         self.fc_et_ref = fc_et_ref
         self.fc_nodes = fc_nodes
+        self.fc_precip_prefix = fc_precip_prefix
 
         self.network = None
         self.nodes = None
         self.network_df = None
         self.nodes_df = None
-        self.precipitation_df = None
+        # self.precipitation_df = None
         self.runoff_df = None
         self.discharge_df = None
         self.points_df = None
@@ -233,14 +234,15 @@ class HydroModeller:
         arcpy.sa.ExtractMultiValuesToPoints(self.fc_nodes, [[self.fc_land_type, field_land_type]])
         arcpy.sa.ExtractMultiValuesToPoints(self.fc_nodes, [[self.fc_et_ref, field_et_ref]])
 
-        # precipitation should be extracted to a separate df?
-        # arcpy.sa.ExtractMultiValuesToPoints(nodes_fc, [[fc_precipitation, field_precipitation]])
+        for i in range(1, 13):
+            arcpy.sa.ExtractMultiValuesToPoints(self.fc_nodes, [['{}{}'.format(self.fc_precip_prefix, i),
+                                                                 '{}{}'.format(field_precip, i)]])
         arcpy.CheckInExtension('Spatial')
 
         # load flowacc and runoff from the shapefile we just created
-        self.nodes_df = pd.DataFrame(arcpy.da.FeatureClassToNumPyArray(self.fc_nodes, (
+        self.nodes_df = pd.DataFrame(arcpy.da.FeatureClassToNumPyArray(self.fc_nodes, [
             'SHAPE@X', 'SHAPE@Y', field_flow_acc, field_gscd, field_land_type,
-            field_et_ref), skip_nulls=False, null_value=0))
+            field_et_ref] + ['{}{}'.format(field_precip, i) for i in range(1,13)], skip_nulls=False, null_value=0))
         arc_refs = pd.Series(dtype=tuple, index=self.nodes_df.index.tolist())
         for index, node in self.nodes_df.iterrows():
             arc_refs[index] = self.nodes[index][3:]
@@ -263,31 +265,33 @@ class HydroModeller:
             self.nodes_df.loc[index, field_flow_acc_local] = actual_flowacc
         self.nodes_df.loc[self.nodes_df[field_flow_acc_local] < 0, field_flow_acc_local] = self.nodes_df[field_flow_acc]
 
-    def rainfall_runoff(self):
+    def rainfall_runoff(self, default_precip_effectiveness, default_runoff_to_gw_fraction, runoff_calibration_accuracy):
         """
         Calculate the runoff from the rainfall using the rainfall-runoff method
         Calibrate against gscd annual values
         """
-        precipitation_se = pd.read_excel('precip.xlsx', index_col=0, squeeze=True)
-        self.precipitation_df = pd.DataFrame(columns=precipitation_se.index, index=self.nodes_df.index)
-        for index, row in self.precipitation_df.iterrows():
-            self.precipitation_df.loc[index] = precipitation_se
+        # precipitation_se = pd.read_excel('precip.xlsx', index_col=0, squeeze=True)
+        # self.precipitation_df = pd.DataFrame(columns=precipitation_se.index, index=self.nodes_df.index)
+        # for index, row in self.precipitation_df.iterrows():
+        #    self.precipitation_df.loc[index] = precipitation_se
 
-        self.runoff_df = pd.DataFrame(columns=self.precipitation_df.columns, index=self.precipitation_df.index)
+        self.runoff_df = pd.DataFrame(columns=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], index=self.nodes_df.index)
 
         k_c = pd.read_excel('k_c.xlsx', index_col=0)
 
         # formula from http://www.weap21.org/webhelp/hydrology.htm
         # for each point, calculate the runoff for each month, then compare to gscd annual value and modify params
-        self.nodes_df['precip_effective'] = 0.5  # default starting values
-        self.nodes_df['runoff_to_gw_fraction'] = 0.5
+        self.nodes_df['precip_effective'] = default_precip_effectiveness  # default starting values
+        self.nodes_df['runoff_to_gw_fraction'] = default_runoff_to_gw_fraction
         for index, row in self.runoff_df.iterrows():
             print('calibrate {}'.format(index))
             counter = 0
             while True:
                 for col in self.runoff_df:
                     et_ref = self.nodes_df.loc[index, field_et_ref]
-                    precip = self.precipitation_df.loc[index, col]
+                    # precip = self.precipitation_df.loc[index, col]
+                    precip = self.nodes_df.loc[index, '{}{}'.format(field_precip, col)] * \
+                             3600 * 24 * days_per_month[col]
                     precip_avail_for_et = precip * self.nodes_df.loc[index, 'precip_effective']
                     et_potential = et_ref * k_c.loc[col, self.nodes_df.loc[index, field_land_type]]
                     runoff = max(0, precip_avail_for_et-et_potential) + \
@@ -301,14 +305,14 @@ class HydroModeller:
 
                 if counter > 10:
                     break
-                elif abs((calc_value - ref_value) / ref_value) < 0.5:
+                elif abs((calc_value - ref_value) / ref_value) < runoff_calibration_accuracy:
                     break
                 else:
                     counter += 1
-                    self.nodes_df.loc[index, 'precip_effective'] *= 1 + (calc_value - ref_value) / ref_value / 10
-                    self.nodes_df.loc[index, 'runoff_to_gw_fraction'] *= 1 + (calc_value - ref_value) / ref_value / 10
+                    self.nodes_df.loc[index, 'precip_effective'] *= 1 + sorted([-0.5, (calc_value - ref_value) / ref_value / 10, 0.5])[1]
+                    self.nodes_df.loc[index, 'runoff_to_gw_fraction'] *= 1 + sorted([-0.5, (calc_value - ref_value) / ref_value / 10, 0.5])[1]
 
-    def calc_discharge(self):
+    def calc_discharge(self, water_loss_factor, max_water_loss_fraction):
         """
         """
 
@@ -316,7 +320,6 @@ class HydroModeller:
 
         # calculate self discharge for each node
         # Q [m3/s] = runoff [mm] * flowacc [number] * area [m2] / 8760 [h/year] * 3600 [s/h] * 1000 [mm/m]
-        days_per_month = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
         self.discharge_df = pd.DataFrame(columns=self.runoff_df.columns, index=self.runoff_df.index)
         for index, row in self.discharge_df.iterrows():
             print('discharge {}'.format(index))
@@ -330,17 +333,17 @@ class HydroModeller:
         self.nodes_df[field_discharge_accumulated] = self.nodes_df[field_discharge_local]
 
         # start from Shreve order 1, and contribute all discharges from upstream nodes to downstream nodes
-        water_loss_factor = 0.000003
         for so in range(1, max(self.network.T[7])+1):
             for arc in self.network:
                 if arc[7] == so:
                     print('contribute {}'.format(arc[0]))
                     self.nodes_df.loc[arc[6], field_discharge_accumulated] += \
-                        self.nodes_df.loc[arc[5],field_discharge_accumulated] * \
-                        (1 - max(0.8, water_loss_factor * arc[8]))
+                        self.nodes_df.loc[arc[5], field_discharge_accumulated] * \
+                        (1 - max(max_water_loss_fraction, water_loss_factor * arc[8]))
                     for col in self.discharge_df:
                         self.discharge_df.loc[arc[6], col] += \
-                            self.discharge_df.loc[arc[5], col] * (1 - max(0.8, water_loss_factor * arc[8]))
+                            self.discharge_df.loc[arc[5], col] * (1 - max(max_water_loss_fraction,
+                                                                          water_loss_factor * arc[8]))
 
         self.nodes_df[field_discharge_max] = -99
         self.nodes_df[field_discharge_mean] = -99
@@ -384,7 +387,7 @@ class HydroModeller:
                 cursor.updateRow(row)
                 print('added {}'.format(index))
 
-    def calc_hydro_potential(self, interval):
+    def calc_hydro_potential(self, interval, eta_t, eta_g, conv):
         """
         Insert points at intervals along every stream and estimate the hydro potential at each
         """
@@ -453,20 +456,17 @@ class HydroModeller:
                 prev_elev = 0
 
         # calculate the power in watts based on Alex's formula
-        # P = rho * g * nt * ng * conv * Q * deltaH
+        # P = rho * g * eta_t * eta_g * conv * Q * deltaH
         rho = 1000  # density
-        g = 9.81  # gravity
-        nt = 0.88  # turbine efficiency
-        ng = 0.96  # generator efficiency
-        conv = 0.6  # conversion factor for environmental flow deduction
-        self.points_df[field_power] = rho * g * nt * ng * conv * \
-                                      self.points_df[field_discharge_accumulated] * self.points_df[field_head]
-        self.points_df[field_power_max] = rho * g * nt * ng * conv * \
-                                          self.points_df[field_discharge_max] * self.points_df[field_head]
-        self.points_df[field_power_mean] = rho * g * nt * ng * conv * \
-                                           self.points_df[field_discharge_mean] * self.points_df[field_head]
-        self.points_df[field_power_min] = rho * g * nt * ng * conv * \
-                                          self.points_df[field_discharge_min] * self.points_df[field_head]
+        g = 9.80665  # gravity
+        self.points_df[field_power] = rho * g * eta_t * eta_g * conv * \
+            self.points_df[field_discharge_accumulated] * self.points_df[field_head]
+        self.points_df[field_power_max] = rho * g * eta_t * eta_g * conv * \
+            self.points_df[field_discharge_max] * self.points_df[field_head]
+        self.points_df[field_power_mean] = rho * g * eta_t * eta_g * conv * \
+            self.points_df[field_discharge_mean] * self.points_df[field_head]
+        self.points_df[field_power_min] = rho * g * eta_t * eta_g * conv * \
+            self.points_df[field_discharge_min] * self.points_df[field_head]
 
         # add the results back into the ArcGIS feature
         arcpy.AddField_management(self.fc_points, field_discharge_accumulated, 'DOUBLE')
@@ -501,22 +501,25 @@ def runner():
     arcpy.env.addOutputsToMap = False
 
     # TODO maybe need to aggregate elevation, as doesn't capture always
-    modeller = HydroModeller(fc_rivers='rivers_ug_tiniest_projected',
+    modeller = HydroModeller(fc_rivers='rivers_ug_small_projected',
                              fc_flow_acc='flow_acc_af_projected',
                              fc_gscd='gscd_qmean_projected',
                              fc_land_type='land_type_projected',
                              fc_elevation='elevation_af_projected',
                              fc_points='hydro_points_ug2',
                              fc_et_ref='et_ref_projected',
-                             fc_nodes='_temp_nodes2')
+                             fc_nodes='_temp_nodes2',
+                             fc_precip_prefix='ave_p_')
 
     modeller.create_network()
     modeller.calc_stream_order()
     modeller.prepare_nodes()
     modeller.calc_flow_acc()
-    modeller.rainfall_runoff()
-    modeller.calc_discharge()
-    modeller.calc_hydro_potential(interval=1000)
+    modeller.rainfall_runoff(default_precip_effectiveness=0.5,
+                             default_runoff_to_gw_fraction=0.5,
+                             runoff_calibration_accuracy=0.2)
+    modeller.calc_discharge(water_loss_factor=0.00001, max_water_loss_fraction=0.2)
+    modeller.calc_hydro_potential(interval=1000, eta_t=0.88, eta_g=0.96, conv=0.6)
 
 
 if __name__ == "__main__":
