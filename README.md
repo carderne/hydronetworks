@@ -1,1 +1,4 @@
-# HydroModeller
+# hydro-networks
+
+hydromodeller.py is deprecated.
+
