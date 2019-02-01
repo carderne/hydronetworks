@@ -1,0 +1,7 @@
+numpy>=1.15.4
+pandas>=0.23.4
+shapely>=1.6.4
+rasterio>=1.0.13
+geopandas>=0.4.0
+pyproj>=1.9.5.1
+matplotlib>=3.0.2
