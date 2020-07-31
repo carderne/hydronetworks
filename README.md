@@ -16,20 +16,17 @@ There's some more detail and pretty pictures in my blog post: [Modelling hydrolo
 
 
 ## Installation
-
-**Requirements**
-
+### Requirements
 hydronetworks is confirmed to work with Python >= 3.6 with the following packages installed:
  - `numpy` >= 1.15.4
  - `pandas` >= 0.23.4
  - `shapely` >= 1.6.4
  - `rasterio` >= 1.0.13
- - `geopandas` >= 0.4.0
- - `pyproj` >= 1.9.5.1
+ - `geopandas` >= 0.6.0
+ - `pyproj` >= 2.2.0
  - `matplotlib` >= 3.0.2
 
-**Install from GitHub**
-
+### Install from GitHub
 Download or clone the repository and install the required packages (preferably in a virtual environment):
 
 ```
@@ -37,4 +34,10 @@ git clone https://github.com/carderne/hydronetworks.git
 cd hydronetworks
 pip install -r requirements.txt
 ```
-You can run ```make test``` in the directory, which will do an entire run through using the test data and confirm whether everything is set up properly.
+
+### Testing
+You can run
+```
+./test.sh
+```
+in the directory, which will do an entire run through using the test data and confirm whether everything is set up properly.
