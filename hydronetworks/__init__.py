@@ -1,1 +1,1 @@
-from hydronetworks.main import *
+from hydronetworks.main import HydroNetworks
