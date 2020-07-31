@@ -29,19 +29,6 @@ class HydroNetworks:
         self.flow = rasterio.open(flow_path)
         self.flowacc = rasterio.open(flowacc_path)
 
-    def save_results(self, path):
-        if isinstance(path, str):
-            path = Path(path)
-        path.mkdir(exist_ok=True, parents=True)
-
-        rivers_path = path / "rivers_out.geojson"
-        nodes_path = path / "nodes_out.geojson"
-        hydro_path = path / "hydro_points.geojson"
-
-        self.rivers_out.to_file(rivers_path, driver="GeoJSON")
-        self.nodes_out.drop("arcs", axis=1).to_file(nodes_path, driver="GeoJSON")
-        self.hydro_points.to_file(hydro_path, driver="GeoJSON")
-
     def create_network(self):
         """
         Create the network and nodes from the river layer, ready to be stream ordered
